@@ -10,16 +10,21 @@
 use bme280_sensor::bme280::{BME280, PresUnit, TempUnit};
 use bt_hci::controller::ExternalController;
 use defmt::Debug2Format;
+use embassy_embedded_hal::shared_bus::asynch::spi::SpiDevice;
 use embassy_executor::Spawner;
 use embassy_futures::select::select;
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex};
 use embassy_time::Timer;
 use esp_hal::{
+    Async,
     clock::CpuClock,
+    gpio::{Level, Output},
     rng::{Trng, TrngSource},
+    spi,
+    time::Rate,
     timer::timg::TimerGroup,
 };
 use esp_radio::ble::controller::BleConnector;
-use static_cell::StaticCell;
 use trouble_host::prelude::*;
 use {esp_backtrace as _, esp_println as _};
 
@@ -29,15 +34,16 @@ const CONNECTIONS_MAX: usize = 1;
 const L2CAP_CHANNELS_MAX: usize = 3;
 const NUS_BUF_SIZE: usize = 256;
 
-type BLECtrl<'a, const N: usize> = ExternalController<BleConnector<'a>, N>;
+macro_rules! mk_static {
+    ($t:ty,$val:expr) => {{
+        static STATIC_CELL: static_cell::StaticCell<$t> = static_cell::StaticCell::new();
+        #[deny(unused_attributes)]
+        let x = STATIC_CELL.uninit().write(($val));
+        x
+    }};
+}
 
-static TRNG: StaticCell<Trng> = StaticCell::new();
-static RADIO_INIT: StaticCell<esp_radio::Controller<'static>> = StaticCell::new();
-static HOST_RESOURCES: StaticCell<
-    HostResources<DefaultPacketPool, CONNECTIONS_MAX, L2CAP_CHANNELS_MAX>,
-> = StaticCell::new();
-static STACK: StaticCell<Stack<'static, BLECtrl<'static, 20>, DefaultPacketPool>> =
-    StaticCell::new();
+type BLECtrl<'a, const N: usize> = ExternalController<BleConnector<'a>, N>;
 
 #[gatt_server]
 struct Server {
@@ -85,10 +91,12 @@ async fn main(spawner: Spawner) -> ! {
 
     defmt::info!("Embassy initialized!");
     let _trng_source = TrngSource::new(peripherals.RNG, peripherals.ADC1);
-    let trng: &'static mut Trng = TRNG.init_with(|| Trng::try_new().expect("No TRNG available")); // Ok when there's a TrngSource accessible
+    let trng: &'static mut Trng = mk_static!(Trng, Trng::try_new().expect("No TRNG available")); // Ok when there's a TrngSource accessible
 
-    let radio_init: &'static esp_radio::Controller<'static> = RADIO_INIT
-        .init_with(|| esp_radio::init().expect("Failed to initialize Wi-Fi/BLE controller"));
+    let radio_init: &'static esp_radio::Controller<'static> = mk_static!(
+        esp_radio::Controller<'static>,
+        esp_radio::init().expect("Failed to initialize Wi-Fi/BLE controller")
+    );
     let (mut _wifi_controller, interfaces) =
         esp_radio::wifi::new(radio_init, peripherals.WIFI, Default::default())
             .expect("Failed to initialize Wi-Fi controller");
@@ -108,13 +116,16 @@ async fn main(spawner: Spawner) -> ! {
     let transport: BleConnector<'static> =
         BleConnector::new(radio_init, peripherals.BT, Default::default()).unwrap();
     let ble_controller = ExternalController::<BleConnector<'static>, 20>::new(transport);
-    let resources: &'static mut HostResources<_, _, _> =
-        HOST_RESOURCES.init_with(|| HostResources::new());
-    let stack = STACK.init_with(|| {
+    let resources: &'static mut HostResources<_, _, _> = mk_static!(
+        HostResources<DefaultPacketPool, CONNECTIONS_MAX, L2CAP_CHANNELS_MAX>,
+        HostResources::new()
+    );
+    let stack = mk_static!(
+        Stack<'static, BLECtrl<'static, 20>, DefaultPacketPool>,
         trouble_host::new(ble_controller, resources)
             .set_random_address(address)
             .set_random_generator_seed(trng)
-    });
+    );
 
     let Host {
         mut peripheral,
@@ -126,16 +137,39 @@ async fn main(spawner: Spawner) -> ! {
     // TODO: Spawn some tasks
     spawner.must_spawn(ble_task(runner));
 
-    let mut bme280 = BME280::new(
-        peripherals.SPI2,   // SPI
-        peripherals.GPIO5,  // CS
-        peripherals.GPIO6,  // SCK
-        peripherals.GPIO10, // MISO
-        peripherals.GPIO7,  // MOSI
-        Default::default(),
+    // BME280 Pins
+    // VCC
+    // GND
+    // SCK
+    // MOSI/SDA/SDI
+    // CS/CSB
+    // MISO/SDO
+    let spi_cfg = spi::master::Config::default()
+        .with_mode(spi::Mode::_0)
+        .with_frequency(Rate::from_mhz(20));
+    let mspi = mk_static!(
+        Mutex<CriticalSectionRawMutex, spi::master::Spi<'static, Async>>,
+        Mutex::new(
+            spi::master::Spi::new(peripherals.SPI2, spi_cfg)
+                .expect("Failed to create master SPI bus")
+                .with_sck(peripherals.GPIO6)
+                .with_mosi(peripherals.GPIO7)
+                .with_miso(peripherals.GPIO2)
+                .into_async()
+        )
     );
+    // let mspi = spi::master::Spi::new(peripherals.SPI2, spi_cfg)
+    //     .expect("Failed to create master SPI bus")
+    //     .with_sck(peripherals.GPIO6)
+    //     .with_mosi(peripherals.GPIO7)
+    //     .with_miso(peripherals.GPIO2)
+    //     .into_async();
 
-    bme280.init().await.expect("Failed to init BME280");
+    let cs1 = Output::new(peripherals.GPIO5, Level::High, Default::default());
+    let sensor_spi = SpiDevice::new(mspi, cs1);
+    let mut sensor = BME280::new(sensor_spi, Default::default());
+
+    sensor.init().await.expect("Failed to init BME280");
 
     let server = Server::new_with_config(GapConfig::Peripheral(PeripheralConfig {
         name: "ESP32-BME280",
@@ -152,7 +186,7 @@ async fn main(spawner: Spawner) -> ! {
 
                 // Set up tasks for this connection
                 let gatt_task = gatt_events_task(&server, &conn);
-                let sensor_task = sensor_notify_task(&server, &conn, &mut bme280);
+                let sensor_task = sensor_notify_task(&server, &conn, &mut sensor);
 
                 // Run until connection closes
                 select(gatt_task, sensor_task).await;
@@ -249,10 +283,10 @@ async fn advertise<'values, 'server, C: Controller>(
 }
 
 /// Task to read sensor and send notifications
-async fn sensor_notify_task(
+async fn sensor_notify_task<SPI: embedded_hal_async::spi::SpiDevice>(
     server: &Server<'_>,
     conn: &GattConnection<'_, '_, DefaultPacketPool>,
-    bme280: &mut BME280<'_>,
+    sensor: &mut BME280<SPI>,
 ) {
     let tx_char = &server.nus.tx;
 
@@ -260,7 +294,7 @@ async fn sensor_notify_task(
         Timer::after_millis(500).await;
 
         // Read sensor
-        match bme280.read_all(TempUnit::Celsius, PresUnit::HPa).await {
+        match sensor.read_all(TempUnit::Celsius, PresUnit::HPa).await {
             Ok(measurements) => {
                 let mut buf: heapless::Vec<u8, NUS_BUF_SIZE> = heapless::Vec::new();
                 let data: serde_json_core::heapless::String<NUS_BUF_SIZE> =

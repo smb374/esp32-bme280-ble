@@ -1,19 +1,6 @@
 #![allow(dead_code)]
 
-use embassy_time::Delay;
 use embedded_hal_async::spi::SpiDevice;
-use embedded_hal_bus::spi::ExclusiveDevice;
-use esp_hal::{
-    Async,
-    gpio::{
-        Level, Output, OutputPin,
-        interconnect::{PeripheralInput, PeripheralOutput},
-    },
-    spi::{
-        self,
-        master::{Instance, Spi},
-    },
-};
 use serde_derive::{Deserialize, Serialize};
 
 // Register addresses
@@ -223,43 +210,20 @@ impl CalibrationData {
     }
 }
 
-type SPIDev<'a> = ExclusiveDevice<Spi<'a, Async>, Output<'a>, Delay>;
+// type SPIDev<'a> = ExclusiveDevice<Spi<'a, Async>, Output<'a>, Delay>;
 
-pub struct BME280<'a> {
-    spi: SPIDev<'a>,
+pub struct BME280<SPI: SpiDevice> {
+    spi: SPI,
     config: Config,
     calib: CalibrationData,
     chip_model: ChipModel,
     initialized: bool,
 }
 
-impl<'a> BME280<'a> {
-    pub fn new(
-        spi_host: impl Instance + 'a,
-        cs_pin: impl OutputPin + 'a,
-        sck_pin: impl PeripheralOutput<'a>,
-        miso_pin: impl PeripheralInput<'a>,
-        mosi_pin: impl PeripheralOutput<'a>,
-        config: Config,
-    ) -> Self {
-        let cs = Output::new(cs_pin, Level::High, Default::default());
-
-        let spi_cfg = spi::master::Config::default()
-            .with_mode(spi::Mode::_0)
-            .with_frequency(esp_hal::time::Rate::from_mhz(1));
-
-        let spi = Spi::new(spi_host, spi_cfg)
-            .expect("Failed to create SPI instance")
-            .with_sck(sck_pin)
-            .with_miso(miso_pin)
-            .with_mosi(mosi_pin)
-            .into_async();
-
-        let dev =
-            ExclusiveDevice::new(spi, cs, Delay).expect("Failed to create exclusive SPI device");
-
+impl<SPI: SpiDevice> BME280<SPI> {
+    pub fn new(spi: SPI, config: Config) -> Self {
         Self {
-            spi: dev,
+            spi,
             config,
             calib: CalibrationData::new(),
             chip_model: ChipModel::Unknown,

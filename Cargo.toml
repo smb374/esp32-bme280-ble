@@ -78,6 +78,7 @@ rand_core = "*"
 serde-json-core = { version = "0.6.0", features = ["defmt", "heapless"] }
 serde = { version = "1.0.228", default-features = false }
 serde_derive = "1.0.228"
+embassy-embedded-hal = { version = "0.5.0", features = ["defmt"] }
 
 
 [profile.dev]
