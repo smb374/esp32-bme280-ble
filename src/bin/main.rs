@@ -7,13 +7,20 @@
 )]
 #![deny(clippy::large_stack_frames)]
 
-use core::fmt::Write;
+use core::{
+    fmt::Write,
+    net::{IpAddr, SocketAddr},
+};
 
 use bme280_sensor::bme280::{BME280, PresUnit, TempUnit};
 use bt_hci::controller::ExternalController;
 use defmt::Debug2Format;
 use embassy_executor::Spawner;
 use embassy_futures::select::select;
+use embassy_net::{
+    StackResources,
+    udp::{PacketMetadata, UdpSocket},
+};
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex};
 use embassy_time::Timer;
 use embedded_graphics::{
@@ -30,16 +37,23 @@ use esp_hal::{
     gpio::{self, Level, Output},
     ledc::{self, Ledc, LowSpeed, channel::ChannelIFace, timer::TimerIFace},
     rng::{Trng, TrngSource},
+    rtc_cntl::Rtc,
     spi,
     time::Rate,
     timer::timg::TimerGroup,
 };
-use esp_radio::ble::controller::BleConnector;
+use esp_radio::{
+    ble::controller::BleConnector,
+    wifi::{ClientConfig, ModeConfig, WifiController, WifiDevice, WifiEvent, WifiStaState},
+};
+use jiff::tz::TimeZone;
 use mipidsi::{
     interface::SpiInterface,
     models::ST7789,
     options::{ColorInversion, ColorOrder, Orientation, Rotation},
 };
+use smoltcp::wire::DnsQueryType;
+use sntpc::{NtpContext, NtpTimestampGenerator, get_time};
 use trouble_host::prelude::*;
 use {esp_backtrace as _, esp_println as _};
 
@@ -48,6 +62,10 @@ extern crate alloc;
 const CONNECTIONS_MAX: usize = 1;
 const L2CAP_CHANNELS_MAX: usize = 3;
 const NUS_BUF_SIZE: usize = 256;
+const WIFI_SSID: &str = env!("WIFI_SSID");
+const WIFI_PASSWD: &str = env!("WIFI_PASSWD");
+const NTP_SERVER: &str = "us.pool.ntp.org";
+const USEC_IN_SEC: u64 = 1_000_000;
 
 macro_rules! mk_static {
     ($t:ty,$val:expr) => {{
@@ -62,7 +80,7 @@ type BLECtrl<'a, const N: usize> = ExternalController<BleConnector<'a>, N>;
 type SPIDevice<'a> = AtomicDevice<'a, spi::master::Spi<'a, Blocking>, Output<'a>, Delay>;
 
 #[gatt_server]
-struct Server {
+struct GattServer {
     nus: NordicUartService,
 }
 
@@ -79,6 +97,26 @@ struct NordicUartService {
         write_without_response
     )]
     rx: heapless::Vec<u8, NUS_BUF_SIZE>,
+}
+
+#[derive(Clone, Copy)]
+struct RTCTimestamp<'a> {
+    rtc: &'a Rtc<'a>,
+    current_time_us: u64,
+}
+
+impl NtpTimestampGenerator for RTCTimestamp<'_> {
+    fn init(&mut self) {
+        self.current_time_us = self.rtc.current_time_us();
+    }
+
+    fn timestamp_sec(&self) -> u64 {
+        self.current_time_us / 1_000_000
+    }
+
+    fn timestamp_subsec_micros(&self) -> u32 {
+        (self.current_time_us % 1_000_000) as u32
+    }
 }
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
@@ -106,6 +144,7 @@ async fn main(spawner: Spawner) -> ! {
     esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
 
     defmt::info!("Embassy initialized!");
+    let rtc: &'static Rtc<'static> = mk_static!(Rtc<'static>, Rtc::new(peripherals.LPWR));
     let _trng_source = TrngSource::new(peripherals.RNG, peripherals.ADC1);
     let trng: &'static mut Trng = mk_static!(Trng, Trng::try_new().expect("No TRNG available")); // Ok when there's a TrngSource accessible
 
@@ -113,42 +152,84 @@ async fn main(spawner: Spawner) -> ! {
         esp_radio::Controller<'static>,
         esp_radio::init().expect("Failed to initialize Wi-Fi/BLE controller")
     );
-    let (mut _wifi_controller, interfaces) =
+    let (wifi_controller, interfaces) =
         esp_radio::wifi::new(radio_init, peripherals.WIFI, Default::default())
             .expect("Failed to initialize Wi-Fi controller");
 
-    let address: Address = Address::random(interfaces.sta.mac_address());
-    let raddr = address.to_bytes();
-    defmt::info!(
-        "Address is {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-        raddr[1],
-        raddr[2],
-        raddr[3],
-        raddr[4],
-        raddr[5],
-        raddr[6],
-    );
-    // find more examples https://github.com/embassy-rs/trouble/tree/main/examples/esp32
-    let transport: BleConnector<'static> =
-        BleConnector::new(radio_init, peripherals.BT, Default::default()).unwrap();
-    let ble_controller = ExternalController::<BleConnector<'static>, 20>::new(transport);
-    let resources: &'static mut HostResources<_, _, _> = mk_static!(
-        HostResources<DefaultPacketPool, CONNECTIONS_MAX, L2CAP_CHANNELS_MAX>,
-        HostResources::new()
-    );
-    let stack = mk_static!(
-        Stack<'static, BLECtrl<'static, 20>, DefaultPacketPool>,
-        trouble_host::new(ble_controller, resources)
-            .set_random_address(address)
-            .set_random_generator_seed(trng)
-    );
+    let wifi_interface = interfaces.sta;
+    let mac = wifi_interface.mac_address();
+    let seed = (trng.random() as u64) << 32 | trng.random() as u64;
+
+    {
+        let config = embassy_net::Config::dhcpv4(Default::default());
+        let (stack, runner): (embassy_net::Stack<'static>, embassy_net::Runner<'static, _>) =
+            embassy_net::new(
+                wifi_interface,
+                config,
+                mk_static!(StackResources<3>, StackResources::<3>::new()),
+                seed,
+            );
+        spawner.spawn(connection(wifi_controller)).ok();
+        spawner.spawn(net_task(runner)).ok();
+
+        loop {
+            if stack.is_link_up() {
+                break;
+            }
+            Timer::after_millis(500).await;
+        }
+
+        defmt::info!("Waiting to get IP address...");
+        loop {
+            if let Some(config) = stack.config_v4() {
+                defmt::info!("Got IP: {}", config.address);
+                break;
+            }
+            Timer::after_millis(500).await;
+        }
+
+        let ntp_addrs = stack.dns_query(NTP_SERVER, DnsQueryType::A).await.unwrap();
+
+        if ntp_addrs.is_empty() {
+            panic!("Failed to resolve DNS. Empty result");
+        }
+
+        sync_rtc(stack, ntp_addrs[0].into(), rtc).await;
+    }
 
     let Host {
-        peripheral, runner, ..
-    }: Host<'static, BLECtrl<'static, 20>, DefaultPacketPool> = stack.build();
-
-    // TODO: Spawn some tasks
-    spawner.must_spawn(ble_task(runner));
+        peripheral: ble_peripheral,
+        runner: ble_runner,
+        ..
+    }: Host<'static, BLECtrl<'static, 20>, DefaultPacketPool> = {
+        let address: Address = Address::random(mac);
+        let raddr = address.to_bytes();
+        defmt::info!(
+            "Address is {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+            raddr[1],
+            raddr[2],
+            raddr[3],
+            raddr[4],
+            raddr[5],
+            raddr[6],
+        );
+        // find more examples https://github.com/embassy-rs/trouble/tree/main/examples/esp32
+        let transport: BleConnector<'static> =
+            BleConnector::new(radio_init, peripherals.BT, Default::default()).unwrap();
+        let ble_controller = ExternalController::<BleConnector<'static>, 20>::new(transport);
+        let resources: &'static mut HostResources<_, _, _> = mk_static!(
+            HostResources<DefaultPacketPool, CONNECTIONS_MAX, L2CAP_CHANNELS_MAX>,
+            HostResources::new()
+        );
+        let stack = mk_static!(
+            Stack<'static, BLECtrl<'static, 20>, DefaultPacketPool>,
+            trouble_host::new(ble_controller, resources)
+                .set_random_address(address)
+                .set_random_generator_seed(trng)
+        );
+        stack.build()
+    };
+    spawner.must_spawn(ble_task(ble_runner));
 
     // BME280 Pins
     // VCC
@@ -185,7 +266,7 @@ async fn main(spawner: Spawner) -> ! {
 
     sensor.get_mut().init().expect("Failed to init BME280");
 
-    spawner.must_spawn(advertise_loop(peripheral, sensor));
+    spawner.must_spawn(advertise_loop(ble_peripheral, sensor));
 
     let lcd_spi = AtomicDevice::new(mspi, cs1, Delay::new()).unwrap();
     let lcd_di = SpiInterface::new(lcd_spi, dc, mk_static!([u8; 4096], [0u8; 4096]));
@@ -242,6 +323,16 @@ async fn main(spawner: Spawner) -> ! {
         drop(guard);
         match res {
             Ok(m) => {
+                let ts = jiff::Timestamp::from_microsecond(rtc.current_time_us() as i64)
+                    .unwrap()
+                    .to_zoned(TimeZone::UTC);
+                let dt = jiff::civil::DateTime::from(ts);
+                txt_buf.clear();
+                write!(&mut txt_buf, "{}", dt).unwrap();
+                if let Err(e) = Text::new(&txt_buf, Point::new(0, 10), txt_style).draw(&mut lcd) {
+                    defmt::error!("Failed to draw: {:?}", Debug2Format(&e));
+                }
+
                 txt_buf.clear();
                 write!(
                     &mut txt_buf,
@@ -258,7 +349,7 @@ async fn main(spawner: Spawner) -> ! {
                 )
                 .unwrap();
 
-                if let Err(e) = Text::new(&txt_buf, Point::new(10, 10), txt_style).draw(&mut lcd) {
+                if let Err(e) = Text::new(&txt_buf, Point::new(0, 30), txt_style).draw(&mut lcd) {
                     defmt::error!("Failed to draw: {:?}", Debug2Format(&e));
                 }
             }
@@ -266,7 +357,51 @@ async fn main(spawner: Spawner) -> ! {
                 defmt::error!("Failed to get readings: {:?}", e);
             }
         }
-        Timer::after_millis(500).await;
+        Timer::after_millis(1000).await;
+    }
+}
+
+#[embassy_executor::task]
+async fn connection(mut controller: WifiController<'static>) {
+    defmt::info!("start connection task");
+    defmt::info!("Device capabilities: {:?}", controller.capabilities());
+    loop {
+        match esp_radio::wifi::sta_state() {
+            WifiStaState::Connected => {
+                // wait until we're no longer connected
+                controller.wait_for_event(WifiEvent::StaDisconnected).await;
+                Timer::after_millis(5000).await
+            }
+            _ => {}
+        }
+        if !matches!(controller.is_started(), Ok(true)) {
+            let station_config = ModeConfig::Client(
+                ClientConfig::default()
+                    .with_ssid(WIFI_SSID.into())
+                    .with_password(WIFI_PASSWD.into()),
+            );
+            controller.set_config(&station_config).unwrap();
+            defmt::info!("Starting wifi");
+            controller.start_async().await.unwrap();
+            defmt::info!("Wifi started!");
+
+            defmt::info!("Scan");
+            let scan_config = esp_radio::wifi::ScanConfig::default().with_max(10);
+            controller
+                .scan_with_config_async(scan_config)
+                .await
+                .unwrap();
+            defmt::info!("Scan done");
+        }
+        defmt::info!("About to connect...");
+
+        match controller.connect_async().await {
+            Ok(_) => defmt::info!("Wifi connected!"),
+            Err(e) => {
+                defmt::info!("Failed to connect to wifi: {:?}", e);
+                Timer::after_millis(5000).await
+            }
+        }
     }
 }
 
@@ -275,7 +410,7 @@ async fn advertise_loop(
     mut peripheral: Peripheral<'static, BLECtrl<'static, 20>, DefaultPacketPool>,
     sensor: &'static Mutex<CriticalSectionRawMutex, BME280<SPIDevice<'static>, Delay>>,
 ) {
-    let server = Server::new_with_config(GapConfig::Peripheral(PeripheralConfig {
+    let server = GattServer::new_with_config(GapConfig::Peripheral(PeripheralConfig {
         name: "ESP32-BME280",
         appearance: &appearance::sensor::TEMPERATURE_SENSOR,
     }))
@@ -303,10 +438,64 @@ async fn advertise_loop(
 }
 
 #[embassy_executor::task]
-async fn ble_task(mut runner: Runner<'static, BLECtrl<'static, 20>, DefaultPacketPool>) {
+async fn ble_task(
+    mut runner: trouble_host::prelude::Runner<'static, BLECtrl<'static, 20>, DefaultPacketPool>,
+) {
     loop {
         if let Err(e) = runner.run().await {
             defmt::error!("Error running BLE: {:?}", Debug2Format(&e));
+        }
+    }
+}
+
+#[embassy_executor::task]
+async fn net_task(mut runner: embassy_net::Runner<'static, WifiDevice<'static>>) {
+    runner.run().await
+}
+
+async fn sync_rtc(stack: embassy_net::Stack<'static>, addr: IpAddr, rtc: &'static Rtc<'static>) {
+    let mut rx_meta = [PacketMetadata::EMPTY; 16];
+    let mut rx_buffer = [0; 4096];
+    let mut tx_meta = [PacketMetadata::EMPTY; 16];
+    let mut tx_buffer = [0; 4096];
+
+    let mut socket = UdpSocket::new(
+        stack,
+        &mut rx_meta,
+        &mut rx_buffer,
+        &mut tx_meta,
+        &mut tx_buffer,
+    );
+
+    socket.bind(123).unwrap();
+
+    defmt::info!("RTC: {}us", rtc.current_time_us());
+
+    let res = get_time(
+        SocketAddr::from((addr, 123)),
+        &socket,
+        NtpContext::new(RTCTimestamp {
+            rtc,
+            current_time_us: 0,
+        }),
+    )
+    .await;
+
+    match res {
+        Ok(time) => {
+            rtc.set_current_time_us(
+                (time.sec() as u64 * USEC_IN_SEC)
+                    + ((time.sec_fraction() as u64 * USEC_IN_SEC) >> 32),
+            );
+            defmt::info!(
+                "RTC Sync: Time: ({}, {}), RTC: {}us",
+                time.sec(),
+                time.sec_fraction(),
+                rtc.current_time_us()
+            );
+        }
+        Err(e) => {
+            defmt::error!("Failed to sync: {:?}", Debug2Format(&e));
         }
     }
 }
@@ -316,7 +505,7 @@ async fn ble_task(mut runner: Runner<'static, BLECtrl<'static, 20>, DefaultPacke
 /// This function will handle the GATT events and process them.
 /// This is how we interact with read and write requests.
 async fn gatt_events_task<P: PacketPool>(
-    server: &Server<'_>,
+    server: &GattServer<'_>,
     conn: &GattConnection<'_, '_, P>,
 ) -> Result<(), Error> {
     let rx_handle = &server.nus.rx;
@@ -355,7 +544,7 @@ async fn gatt_events_task<P: PacketPool>(
 async fn advertise<'values, 'server, C: Controller>(
     name: &'values str,
     peripheral: &mut Peripheral<'values, C, DefaultPacketPool>,
-    server: &'server Server<'values>,
+    server: &'server GattServer<'values>,
 ) -> Result<GattConnection<'values, 'server, DefaultPacketPool>, BleHostError<C::Error>> {
     let mut advertiser_data = [0; 128];
     let Uuid::Uuid128(id) = uuid!("6e400001-b5a3-f393-e0a9-e50e24dcca9e") else {
@@ -386,7 +575,7 @@ async fn advertise<'values, 'server, C: Controller>(
 
 /// Task to read sensor and send notifications
 async fn sensor_notify_task(
-    server: &Server<'_>,
+    server: &GattServer<'_>,
     conn: &GattConnection<'_, '_, DefaultPacketPool>,
     sensor: &'static Mutex<CriticalSectionRawMutex, BME280<SPIDevice<'static>, Delay>>,
 ) {
