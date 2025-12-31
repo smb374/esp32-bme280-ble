@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use embedded_hal_async::spi::SpiDevice;
+use embedded_hal::{delay::DelayNs, spi::SpiDevice};
 use serde_derive::{Deserialize, Serialize};
 
 // Register addresses
@@ -210,20 +210,20 @@ impl CalibrationData {
     }
 }
 
-// type SPIDev<'a> = ExclusiveDevice<Spi<'a, Async>, Output<'a>, Delay>;
-
-pub struct BME280<SPI: SpiDevice> {
+pub struct BME280<SPI: SpiDevice, D: DelayNs> {
     spi: SPI,
+    delay: D,
     config: Config,
     calib: CalibrationData,
     chip_model: ChipModel,
     initialized: bool,
 }
 
-impl<SPI: SpiDevice> BME280<SPI> {
-    pub fn new(spi: SPI, config: Config) -> Self {
+impl<SPI: SpiDevice, D: DelayNs> BME280<SPI, D> {
+    pub fn new(spi: SPI, delay: D, config: Config) -> Self {
         Self {
             spi,
+            delay,
             config,
             calib: CalibrationData::new(),
             chip_model: ChipModel::Unknown,
@@ -231,11 +231,10 @@ impl<SPI: SpiDevice> BME280<SPI> {
         }
     }
 
-    pub async fn init(&mut self) -> Result<(), &'static str> {
+    pub fn init(&mut self) -> Result<(), &'static str> {
         // Read and verify chip ID
         let chip_id = self
             .read_register(REG_CHIP_ID)
-            .await
             .map_err(|_| "Failed to read chip ID")?;
 
         defmt::info!("BME280 Chip ID: {:#02X}", chip_id);
@@ -247,62 +246,57 @@ impl<SPI: SpiDevice> BME280<SPI> {
         };
 
         // Read calibration data
-        self.read_calibration().await?;
+        self.read_calibration()?;
 
         // Initialize filter if needed
         if !matches!(self.config.filter, Filter::Off) {
-            self.initialize_filter().await?;
+            self.initialize_filter()?;
         }
 
         // Write settings
-        self.write_settings().await?;
+        self.write_settings()?;
 
         self.initialized = true;
         Ok(())
     }
 
-    pub async fn reset(&mut self) -> Result<(), &'static str> {
+    pub fn reset(&mut self) -> Result<(), &'static str> {
         self.write_register(REG_RESET, RESET_VALUE)
-            .await
             .map_err(|_| "Failed to reset")?;
-        embassy_time::Timer::after_millis(2).await;
-        self.init().await
+        self.delay.delay_ms(2);
+        self.init()
     }
 
-    async fn initialize_filter(&mut self) -> Result<(), &'static str> {
+    fn initialize_filter(&mut self) -> Result<(), &'static str> {
         // Force unfiltered measurement to populate filter buffer
         let original_filter = self.config.filter;
         self.config.filter = Filter::Off;
 
-        self.write_settings().await?;
+        self.write_settings()?;
 
         // Read dummy measurement
-        let _ = self.read_all(TempUnit::Celsius, PresUnit::HPa).await;
+        let _ = self.read_all(TempUnit::Celsius, PresUnit::HPa);
 
         self.config.filter = original_filter;
         Ok(())
     }
 
-    async fn read_calibration(&mut self) -> Result<(), &'static str> {
+    fn read_calibration(&mut self) -> Result<(), &'static str> {
         let mut calib_data = [0u8; 32];
 
         // Temperature and pressure calibration (0x88-0x9F = 24 bytes)
         self.read_registers(REG_TEMP_DIG, &mut calib_data[0..6])
-            .await
             .map_err(|_| "Failed to read temp calib")?;
 
         self.read_registers(REG_PRESS_DIG, &mut calib_data[6..24])
-            .await
             .map_err(|_| "Failed to read press calib")?;
 
         // Humidity calibration part 1 (0xA1 = 1 byte)
         self.read_registers(REG_HUM_DIG_1, &mut calib_data[24..25])
-            .await
             .map_err(|_| "Failed to read hum calib 1")?;
 
         // Humidity calibration part 2 (0xE1-0xE7 = 7 bytes)
         self.read_registers(REG_HUM_DIG_2, &mut calib_data[25..32])
-            .await
             .map_err(|_| "Failed to read hum calib 2")?;
 
         // Copy to self.calib.dig
@@ -312,7 +306,7 @@ impl<SPI: SpiDevice> BME280<SPI> {
         Ok(())
     }
 
-    async fn write_settings(&mut self) -> Result<(), &'static str> {
+    fn write_settings(&mut self) -> Result<(), &'static str> {
         let ctrl_hum = self.config.hum_oversample as u8;
 
         let ctrl_meas = ((self.config.temp_oversample as u8) << 5)
@@ -322,44 +316,40 @@ impl<SPI: SpiDevice> BME280<SPI> {
         let config = ((self.config.standby_time as u8) << 5) | ((self.config.filter as u8) << 2);
 
         self.write_register(REG_CTRL_HUM, ctrl_hum)
-            .await
             .map_err(|_| "Failed to write CTRL_HUM")?;
 
         self.write_register(REG_CTRL_MEAS, ctrl_meas)
-            .await
             .map_err(|_| "Failed to write CTRL_MEAS")?;
 
         self.write_register(REG_CONFIG, config)
-            .await
             .map_err(|_| "Failed to write CONFIG")?;
 
         Ok(())
     }
 
-    async fn read_data(&mut self) -> Result<[u8; 8], &'static str> {
+    fn read_data(&mut self) -> Result<[u8; 8], &'static str> {
         // For forced mode, trigger measurement
         if matches!(self.config.mode, Mode::Forced) {
-            self.write_settings().await?;
+            self.write_settings()?;
         }
 
         let mut data = [0u8; 8];
         self.read_registers(REG_PRESS_MSB, &mut data)
-            .await
             .map_err(|_| "Failed to read sensor data")?;
 
         Ok(data)
     }
 
-    pub async fn read_temperature(&mut self, unit: TempUnit) -> Result<f32, &'static str> {
-        let data = self.read_data().await?;
+    pub fn read_temperature(&mut self, unit: TempUnit) -> Result<f32, &'static str> {
+        let data = self.read_data()?;
         let raw_temp = ((data[3] as u32) << 12) | ((data[4] as u32) << 4) | ((data[5] as u32) >> 4);
 
         let mut t_fine = 0i32;
         Ok(self.calculate_temperature(raw_temp as i32, &mut t_fine, unit))
     }
 
-    pub async fn read_pressure(&mut self, unit: PresUnit) -> Result<f32, &'static str> {
-        let data = self.read_data().await?;
+    pub fn read_pressure(&mut self, unit: PresUnit) -> Result<f32, &'static str> {
+        let data = self.read_data()?;
         let raw_temp = ((data[3] as u32) << 12) | ((data[4] as u32) << 4) | ((data[5] as u32) >> 4);
         let raw_pres = ((data[0] as u32) << 12) | ((data[1] as u32) << 4) | ((data[2] as u32) >> 4);
 
@@ -368,8 +358,8 @@ impl<SPI: SpiDevice> BME280<SPI> {
         Ok(self.calculate_pressure(raw_pres as i32, t_fine, unit))
     }
 
-    pub async fn read_humidity(&mut self) -> Result<f32, &'static str> {
-        let data = self.read_data().await?;
+    pub fn read_humidity(&mut self) -> Result<f32, &'static str> {
+        let data = self.read_data()?;
         let raw_temp = ((data[3] as u32) << 12) | ((data[4] as u32) << 4) | ((data[5] as u32) >> 4);
         let raw_hum = ((data[6] as u32) << 8) | (data[7] as u32);
 
@@ -378,12 +368,12 @@ impl<SPI: SpiDevice> BME280<SPI> {
         Ok(self.calculate_humidity(raw_hum as i32, t_fine))
     }
 
-    pub async fn read_all(
+    pub fn read_all(
         &mut self,
         temp_unit: TempUnit,
         pres_unit: PresUnit,
     ) -> Result<Measurements, &'static str> {
-        let data = self.read_data().await?;
+        let data = self.read_data()?;
 
         let raw_pres = ((data[0] as u32) << 12) | ((data[1] as u32) << 4) | ((data[2] as u32) >> 4);
         let raw_temp = ((data[3] as u32) << 12) | ((data[4] as u32) << 4) | ((data[5] as u32) >> 4);
@@ -487,28 +477,27 @@ impl<SPI: SpiDevice> BME280<SPI> {
     }
 
     // Low-level SPI operations
-    async fn read_register(&mut self, reg: u8) -> Result<u8, ()> {
+    fn read_register(&mut self, reg: u8) -> Result<u8, ()> {
         let mut buf = [reg | 0x80, 0x00];
-        self.spi.transfer_in_place(&mut buf).await.map_err(|_| ())?;
+        self.spi.transfer_in_place(&mut buf).map_err(|_| ())?;
         Ok(buf[1])
     }
 
-    async fn read_registers(&mut self, reg: u8, buf: &mut [u8]) -> Result<(), ()> {
+    fn read_registers(&mut self, reg: u8, buf: &mut [u8]) -> Result<(), ()> {
         let mut tx_buf = [0u8; 64];
         tx_buf[0] = reg | 0x80;
 
         let total_len = buf.len() + 1;
         self.spi
             .transfer_in_place(&mut tx_buf[..total_len])
-            .await
             .map_err(|_| ())?;
         buf.copy_from_slice(&tx_buf[1..total_len]);
         Ok(())
     }
 
-    async fn write_register(&mut self, reg: u8, value: u8) -> Result<(), ()> {
+    fn write_register(&mut self, reg: u8, value: u8) -> Result<(), ()> {
         let buf = [reg & 0x7F, value];
-        self.spi.write(&buf).await.map_err(|_| ())?;
+        self.spi.write(&buf).map_err(|_| ())?;
         Ok(())
     }
 }

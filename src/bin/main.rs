@@ -7,24 +7,39 @@
 )]
 #![deny(clippy::large_stack_frames)]
 
+use core::fmt::Write;
+
 use bme280_sensor::bme280::{BME280, PresUnit, TempUnit};
 use bt_hci::controller::ExternalController;
 use defmt::Debug2Format;
-use embassy_embedded_hal::shared_bus::asynch::spi::SpiDevice;
 use embassy_executor::Spawner;
 use embassy_futures::select::select;
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex};
 use embassy_time::Timer;
+use embedded_graphics::{
+    mono_font::{MonoTextStyleBuilder, iso_8859_1::FONT_9X15},
+    pixelcolor::Rgb565,
+    prelude::*,
+    text::Text,
+};
+use embedded_hal_bus::{spi::AtomicDevice, util::AtomicCell};
 use esp_hal::{
-    Async,
+    Blocking,
     clock::CpuClock,
-    gpio::{Level, Output},
+    delay::Delay,
+    gpio::{self, Level, Output},
+    ledc::{self, Ledc, LowSpeed, channel::ChannelIFace, timer::TimerIFace},
     rng::{Trng, TrngSource},
     spi,
     time::Rate,
     timer::timg::TimerGroup,
 };
 use esp_radio::ble::controller::BleConnector;
+use mipidsi::{
+    interface::SpiInterface,
+    models::ST7789,
+    options::{ColorInversion, ColorOrder, Orientation, Rotation},
+};
 use trouble_host::prelude::*;
 use {esp_backtrace as _, esp_println as _};
 
@@ -44,6 +59,7 @@ macro_rules! mk_static {
 }
 
 type BLECtrl<'a, const N: usize> = ExternalController<BleConnector<'a>, N>;
+type SPIDevice<'a> = AtomicDevice<'a, spi::master::Spi<'a, Blocking>, Output<'a>, Delay>;
 
 #[gatt_server]
 struct Server {
@@ -128,11 +144,8 @@ async fn main(spawner: Spawner) -> ! {
     );
 
     let Host {
-        mut peripheral,
-        runner,
-        ..
-    }: Host<'static, ExternalController<BleConnector<'static>, 20>, DefaultPacketPool> =
-        stack.build();
+        peripheral, runner, ..
+    }: Host<'static, BLECtrl<'static, 20>, DefaultPacketPool> = stack.build();
 
     // TODO: Spawn some tasks
     spawner.must_spawn(ble_task(runner));
@@ -148,36 +161,125 @@ async fn main(spawner: Spawner) -> ! {
         .with_mode(spi::Mode::_0)
         .with_frequency(Rate::from_mhz(20));
     let mspi = mk_static!(
-        Mutex<CriticalSectionRawMutex, spi::master::Spi<'static, Async>>,
-        Mutex::new(
+        AtomicCell<spi::master::Spi<'static, Blocking>>,
+        AtomicCell::new(
             spi::master::Spi::new(peripherals.SPI2, spi_cfg)
                 .expect("Failed to create master SPI bus")
                 .with_sck(peripherals.GPIO6)
                 .with_mosi(peripherals.GPIO7)
                 .with_miso(peripherals.GPIO2)
-                .into_async()
         )
     );
-    // let mspi = spi::master::Spi::new(peripherals.SPI2, spi_cfg)
-    //     .expect("Failed to create master SPI bus")
-    //     .with_sck(peripherals.GPIO6)
-    //     .with_mosi(peripherals.GPIO7)
-    //     .with_miso(peripherals.GPIO2)
-    //     .into_async();
 
+    let cs0 = Output::new(peripherals.GPIO4, Level::High, Default::default());
     let cs1 = Output::new(peripherals.GPIO5, Level::High, Default::default());
-    let sensor_spi = SpiDevice::new(mspi, cs1);
-    let mut sensor = BME280::new(sensor_spi, Default::default());
+    let dc = Output::new(peripherals.GPIO3, Level::Low, Default::default());
+    let rst = Output::new(peripherals.GPIO10, Level::Low, Default::default());
 
-    sensor.init().await.expect("Failed to init BME280");
+    let sensor_spi = AtomicDevice::new(mspi, cs0, Delay::new()).unwrap();
 
+    let sensor = mk_static!(
+        Mutex<CriticalSectionRawMutex, BME280<SPIDevice<'static>, Delay>>,
+       Mutex::new(BME280::new(sensor_spi, Delay::new(), Default::default()))
+    );
+
+    sensor.get_mut().init().expect("Failed to init BME280");
+
+    spawner.must_spawn(advertise_loop(peripheral, sensor));
+
+    let lcd_spi = AtomicDevice::new(mspi, cs1, Delay::new()).unwrap();
+    let lcd_di = SpiInterface::new(lcd_spi, dc, mk_static!([u8; 4096], [0u8; 4096]));
+
+    let mut lcd = mipidsi::Builder::new(ST7789, lcd_di)
+        .reset_pin(rst)
+        .color_order(ColorOrder::Rgb)
+        .display_size(240, 320)
+        .orientation(Orientation::new().rotate(Rotation::Deg90))
+        .invert_colors(ColorInversion::Inverted)
+        .init(&mut Delay::new())
+        .expect("Failed to init display");
+
+    {
+        let mut ledc = Ledc::new(peripherals.LEDC);
+        ledc.set_global_slow_clock(ledc::LSGlobalClkSource::APBClk);
+
+        let mut lstimer0: ledc::timer::Timer<'_, LowSpeed> =
+            ledc.timer::<LowSpeed>(ledc::timer::Number::Timer0);
+        lstimer0
+            .configure(ledc::timer::config::Config {
+                duty: ledc::timer::config::Duty::Duty13Bit,
+                clock_source: ledc::timer::LSClockSource::APBClk,
+                frequency: Rate::from_hz(5000),
+            })
+            .expect("Failed to configure backlight timer");
+
+        let mut chan: ledc::channel::Channel<'_, LowSpeed> =
+            ledc.channel::<LowSpeed>(ledc::channel::Number::Channel0, peripherals.GPIO11);
+        chan.configure(ledc::channel::config::Config {
+            timer: &lstimer0,
+            duty_pct: 100,
+            drive_mode: gpio::DriveMode::PushPull,
+        })
+        .expect("Failed to configure backlight channel");
+
+        chan.set_duty(25).expect("Failed to update backlight");
+    }
+
+    lcd.clear(Rgb565::BLACK).expect("Failed to clear screen");
+    Timer::after_millis(10).await;
+
+    let txt_style = MonoTextStyleBuilder::new()
+        .background_color(Rgb565::BLACK)
+        .text_color(Rgb565::WHITE)
+        .font(&FONT_9X15)
+        .build();
+
+    let mut txt_buf: heapless::String<256> = heapless::String::new();
+
+    loop {
+        let mut guard = sensor.lock().await;
+        let res = guard.read_all(TempUnit::Celsius, PresUnit::HPa);
+        drop(guard);
+        match res {
+            Ok(m) => {
+                txt_buf.clear();
+                write!(
+                    &mut txt_buf,
+                    "{: <8}: {:>8.2}{: >4}\n{: <8}: {:>8.2}{: >4}\n{: <8}: {:>8.2}{: >4}\n",
+                    "Temp",
+                    m.temperature,
+                    "\u{00B0}C",
+                    "Pressure",
+                    m.pressure,
+                    "HPa",
+                    "Humidity",
+                    m.humidity,
+                    "%"
+                )
+                .unwrap();
+
+                if let Err(e) = Text::new(&txt_buf, Point::new(10, 10), txt_style).draw(&mut lcd) {
+                    defmt::error!("Failed to draw: {:?}", Debug2Format(&e));
+                }
+            }
+            Err(e) => {
+                defmt::error!("Failed to get readings: {:?}", e);
+            }
+        }
+        Timer::after_millis(500).await;
+    }
+}
+
+#[embassy_executor::task]
+async fn advertise_loop(
+    mut peripheral: Peripheral<'static, BLECtrl<'static, 20>, DefaultPacketPool>,
+    sensor: &'static Mutex<CriticalSectionRawMutex, BME280<SPIDevice<'static>, Delay>>,
+) {
     let server = Server::new_with_config(GapConfig::Peripheral(PeripheralConfig {
         name: "ESP32-BME280",
         appearance: &appearance::sensor::TEMPERATURE_SENSOR,
     }))
     .unwrap();
-
-    // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v~1.0/examples
 
     loop {
         match advertise("ESP32-BME280", &mut peripheral, &server).await {
@@ -186,7 +288,7 @@ async fn main(spawner: Spawner) -> ! {
 
                 // Set up tasks for this connection
                 let gatt_task = gatt_events_task(&server, &conn);
-                let sensor_task = sensor_notify_task(&server, &conn, &mut sensor);
+                let sensor_task = sensor_notify_task(&server, &conn, sensor);
 
                 // Run until connection closes
                 select(gatt_task, sensor_task).await;
@@ -283,19 +385,20 @@ async fn advertise<'values, 'server, C: Controller>(
 }
 
 /// Task to read sensor and send notifications
-async fn sensor_notify_task<SPI: embedded_hal_async::spi::SpiDevice>(
+async fn sensor_notify_task(
     server: &Server<'_>,
     conn: &GattConnection<'_, '_, DefaultPacketPool>,
-    sensor: &mut BME280<SPI>,
+    sensor: &'static Mutex<CriticalSectionRawMutex, BME280<SPIDevice<'static>, Delay>>,
 ) {
     let tx_char = &server.nus.tx;
-
     loop {
-        Timer::after_millis(500).await;
+        Timer::after_millis(5000).await;
 
         // Read sensor
-        match sensor.read_all(TempUnit::Celsius, PresUnit::HPa).await {
+        let mut guard = sensor.lock().await;
+        match guard.read_all(TempUnit::Celsius, PresUnit::HPa) {
             Ok(measurements) => {
+                drop(guard);
                 let mut buf: heapless::Vec<u8, NUS_BUF_SIZE> = heapless::Vec::new();
                 let data: serde_json_core::heapless::String<NUS_BUF_SIZE> =
                     match serde_json_core::to_string(&measurements) {
