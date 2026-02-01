@@ -148,96 +148,6 @@ async fn main(spawner: Spawner) -> ! {
     let _trng_source = TrngSource::new(peripherals.RNG, peripherals.ADC1);
     let trng: &'static mut Trng = mk_static!(Trng, Trng::try_new().expect("No TRNG available")); // Ok when there's a TrngSource accessible
 
-    let radio_init: &'static esp_radio::Controller<'static> = mk_static!(
-        esp_radio::Controller<'static>,
-        esp_radio::init().expect("Failed to initialize Wi-Fi/BLE controller")
-    );
-    let (wifi_controller, interfaces) =
-        esp_radio::wifi::new(radio_init, peripherals.WIFI, Default::default())
-            .expect("Failed to initialize Wi-Fi controller");
-
-    let wifi_interface = interfaces.sta;
-    let mac = wifi_interface.mac_address();
-    let seed = (trng.random() as u64) << 32 | trng.random() as u64;
-
-    {
-        let config = embassy_net::Config::dhcpv4(Default::default());
-        let (stack, runner): (embassy_net::Stack<'static>, embassy_net::Runner<'static, _>) =
-            embassy_net::new(
-                wifi_interface,
-                config,
-                mk_static!(StackResources<3>, StackResources::<3>::new()),
-                seed,
-            );
-        spawner.spawn(connection(wifi_controller)).ok();
-        spawner.spawn(net_task(runner)).ok();
-
-        loop {
-            if stack.is_link_up() {
-                break;
-            }
-            Timer::after_millis(500).await;
-        }
-
-        defmt::info!("Waiting to get IP address...");
-        loop {
-            if let Some(config) = stack.config_v4() {
-                defmt::info!("Got IP: {}", config.address);
-                break;
-            }
-            Timer::after_millis(500).await;
-        }
-
-        let ntp_addrs = stack.dns_query(NTP_SERVER, DnsQueryType::A).await.unwrap();
-
-        if ntp_addrs.is_empty() {
-            panic!("Failed to resolve DNS. Empty result");
-        }
-
-        sync_rtc(stack, ntp_addrs[0].into(), rtc).await;
-    }
-
-    let Host {
-        peripheral: ble_peripheral,
-        runner: ble_runner,
-        ..
-    }: Host<'static, BLECtrl<'static, 20>, DefaultPacketPool> = {
-        let address: Address = Address::random(mac);
-        let raddr = address.to_bytes();
-        defmt::info!(
-            "Address is {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-            raddr[1],
-            raddr[2],
-            raddr[3],
-            raddr[4],
-            raddr[5],
-            raddr[6],
-        );
-        // find more examples https://github.com/embassy-rs/trouble/tree/main/examples/esp32
-        let transport: BleConnector<'static> =
-            BleConnector::new(radio_init, peripherals.BT, Default::default()).unwrap();
-        let ble_controller = ExternalController::<BleConnector<'static>, 20>::new(transport);
-        let resources: &'static mut HostResources<_, _, _> = mk_static!(
-            HostResources<DefaultPacketPool, CONNECTIONS_MAX, L2CAP_CHANNELS_MAX>,
-            HostResources::new()
-        );
-        let stack = mk_static!(
-            Stack<'static, BLECtrl<'static, 20>, DefaultPacketPool>,
-            trouble_host::new(ble_controller, resources)
-                .set_random_address(address)
-                .set_random_generator_seed(trng)
-        );
-        stack.build()
-    };
-    spawner.must_spawn(ble_task(ble_runner));
-
-    // BME280 Pins
-    // VCC
-    // GND
-    // SCK
-    // MOSI/SDA/SDI
-    // CS/CSB
-    // MISO/SDO
     let spi_cfg = spi::master::Config::default()
         .with_mode(spi::Mode::_0)
         .with_frequency(Rate::from_mhz(20));
@@ -265,8 +175,6 @@ async fn main(spawner: Spawner) -> ! {
     );
 
     sensor.get_mut().init().expect("Failed to init BME280");
-
-    spawner.must_spawn(advertise_loop(ble_peripheral, sensor));
 
     let lcd_spi = AtomicDevice::new(mspi, cs1, Delay::new()).unwrap();
     let lcd_di = SpiInterface::new(lcd_spi, dc, mk_static!([u8; 4096], [0u8; 4096]));
@@ -303,11 +211,95 @@ async fn main(spawner: Spawner) -> ! {
         })
         .expect("Failed to configure backlight channel");
 
-        chan.set_duty(25).expect("Failed to update backlight");
+        chan.set_duty(50).expect("Failed to update backlight");
     }
 
     lcd.clear(Rgb565::BLACK).expect("Failed to clear screen");
     Timer::after_millis(10).await;
+
+    let radio_init: &'static esp_radio::Controller<'static> = mk_static!(
+        esp_radio::Controller<'static>,
+        esp_radio::init().expect("Failed to initialize Wi-Fi/BLE controller")
+    );
+    let (wifi_controller, interfaces) =
+        esp_radio::wifi::new(radio_init, peripherals.WIFI, Default::default())
+            .expect("Failed to initialize Wi-Fi controller");
+
+    let wifi_interface = interfaces.sta;
+    let mac = wifi_interface.mac_address();
+    let seed = (trng.random() as u64) << 32 | trng.random() as u64;
+
+    let Host {
+        peripheral: ble_peripheral,
+        runner: ble_runner,
+        ..
+    }: Host<'static, BLECtrl<'static, 20>, DefaultPacketPool> = {
+        let address: Address = Address::random(mac);
+        let raddr = address.to_bytes();
+        defmt::info!(
+            "Address is {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+            raddr[1],
+            raddr[2],
+            raddr[3],
+            raddr[4],
+            raddr[5],
+            raddr[6],
+        );
+        // find more examples https://github.com/embassy-rs/trouble/tree/main/examples/esp32
+        let transport: BleConnector<'static> =
+            BleConnector::new(radio_init, peripherals.BT, Default::default()).unwrap();
+        let ble_controller = ExternalController::<BleConnector<'static>, 20>::new(transport);
+        let resources: &'static mut HostResources<_, _, _> = mk_static!(
+            HostResources<DefaultPacketPool, CONNECTIONS_MAX, L2CAP_CHANNELS_MAX>,
+            HostResources::new()
+        );
+        let stack = mk_static!(
+            Stack<'static, BLECtrl<'static, 20>, DefaultPacketPool>,
+            trouble_host::new(ble_controller, resources)
+                .set_random_address(address)
+                .set_random_generator_seed(trng)
+        );
+        stack.build()
+    };
+    spawner.must_spawn(ble_task(ble_runner));
+    spawner.must_spawn(advertise_loop(ble_peripheral, sensor));
+
+    {
+        let config = embassy_net::Config::dhcpv4(Default::default());
+        let (stack, runner): (embassy_net::Stack<'static>, embassy_net::Runner<'static, _>) =
+            embassy_net::new(
+                wifi_interface,
+                config,
+                mk_static!(StackResources<3>, StackResources::<3>::new()),
+                seed,
+            );
+        spawner.spawn(connection(wifi_controller)).ok();
+        spawner.spawn(net_task(runner)).ok();
+
+        loop {
+            if stack.is_link_up() {
+                break;
+            }
+            Timer::after_millis(100).await;
+        }
+
+        defmt::info!("Waiting to get IP address...");
+        loop {
+            if let Some(config) = stack.config_v4() {
+                defmt::info!("Got IP: {}", config.address);
+                break;
+            }
+            Timer::after_millis(100).await;
+        }
+
+        let ntp_addrs = stack.dns_query(NTP_SERVER, DnsQueryType::A).await.unwrap();
+
+        if ntp_addrs.is_empty() {
+            panic!("Failed to resolve DNS. Empty result");
+        }
+
+        sync_rtc(stack, ntp_addrs[0].into(), rtc).await;
+    }
 
     let txt_style = MonoTextStyleBuilder::new()
         .background_color(Rgb565::BLACK)
